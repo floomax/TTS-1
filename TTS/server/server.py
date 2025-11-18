@@ -9,11 +9,12 @@ from threading import Lock
 from typing import Union
 from urllib.parse import parse_qs
 
-from flask import Flask, render_template, render_template_string, request, send_file
+from flask import Flask, render_template, render_template_string, request, send_file, jsonify
 
 from TTS.config import load_config
 from TTS.utils.manage import ModelManager
 from TTS.utils.synthesizer import Synthesizer
+from TTS.api import TTS
 
 
 def create_argparser():
@@ -112,6 +113,13 @@ synthesizer = Synthesizer(
     encoder_config="",
     use_cuda=args.use_cuda,
 )
+
+# Initialize TTS API for complete functionality
+tts = TTS(model_name=args.model_name, gpu=args.use_cuda) if args.model_name else TTS(
+    model_path=model_path, config_path=config_path, vocoder_path=vocoder_path, vocoder_config_path=vocoder_config_path, gpu=args.use_cuda
+)
+
+vc_tts = None  # For TTS with voice conversion
 
 use_multi_speaker = hasattr(synthesizer.tts_model, "num_speakers") and (
     synthesizer.tts_model.num_speakers > 1 or synthesizer.tts_speakers_file is not None
@@ -248,6 +256,190 @@ def mary_tts_api_process():
         out = io.BytesIO()
         synthesizer.save_wav(wavs, out)
     return send_file(out, mimetype="audio/wav")
+
+
+# Comprehensive API endpoints for full model interaction
+
+@app.route("/api/models", methods=["GET"])
+def list_models():
+    """List all available TTS models"""
+    try:
+        models = manager.list_tts_models()
+        return jsonify({"models": models, "vc_models": manager.list_vc_models()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/model/info", methods=["GET"])
+def current_model_info():
+    """Get information about the current loaded model"""
+    try:
+        info = {
+            "model_name": getattr(tts, 'model_name', args.model_name),
+            "is_multi_speaker": tts.is_multi_speaker,
+            "is_multi_lingual": tts.is_multi_lingual,
+            "speakers": tts.speakers,
+            "languages": tts.languages
+        }
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/model/switch", methods=["POST"])
+def switch_model():
+    """Switch to a different model (simplified version, restarts included)"""
+    try:
+        global tts, synthesizer
+        new_model = request.json.get("model_name")
+        if not new_model:
+            return jsonify({"error": "model_name required"}), 400
+
+        # Load new TTS model
+        tts = TTS(model_name=new_model, gpu=args.use_cuda)
+        return jsonify({"message": f"Switched to {new_model}"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/vc", methods=["POST"])
+def voice_conversion():
+    """Voice conversion between audio files"""
+    try:
+        source_file = request.files.get("source_wav")
+        target_file = request.files.get("target_wav")
+
+        if not source_file or not target_file:
+            return jsonify({"error": "Both source_wav and target_wav files are required"}), 400
+
+        # Save temp files
+        source_path = f"/tmp/source_{hash(source_file.filename)}.wav"
+        target_path = f"/tmp/target_{hash(target_file.filename)}.wav"
+        source_file.save(source_path)
+        target_file.save(target_path)
+
+        # Load VC model if not loaded
+        global vc_tts
+        if vc_tts is None or not hasattr(vc_tts, 'voice_converter'):
+            vc_tts = TTS("voice_conversion_models/multilingual/vctk/freevc24", gpu=args.use_cuda)
+
+        with lock:
+            wav = vc_tts.voice_conversion(source_wav=source_path, target_wav=target_path)
+            out = io.BytesIO()
+            from TTS.utils.audio.numpy_transforms import save_wav
+            save_wav(wav=wav, path=out, sample_rate=vc_tts.voice_converter.vc_config.audio.output_sample_rate)
+            out.seek(0)
+
+        # Cleanup temp files
+        os.remove(source_path)
+        os.remove(target_path)
+
+        return send_file(out, mimetype="audio/wav")
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tts_vc", methods=["POST"])
+def tts_with_vc():
+    """TTS with voice conversion (cloning)"""
+    try:
+        text = request.form.get("text", "")
+        language = request.form.get("language")
+        speaker_wav = request.files.get("speaker_wav")
+
+        if not text:
+            return jsonify({"error": "text is required"}), 400
+        if not speaker_wav:
+            return jsonify({"error": "speaker_wav file is required"}), 400
+
+        # Save temp file
+        speaker_path = f"/tmp/speaker_{hash(speaker_wav.filename)}.wav"
+        speaker_wav.save(speaker_path)
+
+        with lock:
+            wav = tts.tts_with_vc(text=text, language=language, speaker_wav=speaker_path)
+            out = io.BytesIO()
+            from TTS.utils.audio.numpy_transforms import save_wav
+            save_wav(wav=wav, path=out, sample_rate=22050)  # Default sample rate
+            out.seek(0)
+
+        # Cleanup temp file
+        os.remove(speaker_path)
+
+        return send_file(out, mimetype="audio/wav")
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/docs", methods=["GET"])
+def api_docs():
+    """API documentation"""
+    docs = {
+        "endpoints": {
+            "/api/tts": {
+                "method": "GET/POST",
+                "description": "Text to speech synthesis",
+                "parameters": {
+                    "text": "Text to synthesize",
+                    "speaker_id": "Speaker ID for multi-speaker models",
+                    "language_id": "Language ID for multi-lingual models",
+                    "style_wav": "Path to style wav or GST tokens JSON"
+                }
+            },
+            "/api/models": {
+                "method": "GET",
+                "description": "List all available models"
+            },
+            "/api/model/info": {
+                "method": "GET",
+                "description": "Get current model information"
+            },
+            "/api/model/switch": {
+                "method": "POST",
+                "description": "Switch to a different model",
+                "parameters": {
+                    "model_name": "Name of the model to switch to"
+                }
+            },
+            "/api/vc": {
+                "method": "POST",
+                "description": "Voice conversion between audio files",
+                "files": {
+                    "source_wav": "Source audio file",
+                    "target_wav": "Target audio file"
+                }
+            },
+            "/api/tts_vc": {
+                "method": "POST",
+                "description": "TTS with voice conversion (voice cloning)",
+                "parameters": {
+                    "text": "Text to synthesize",
+                    "language": "Language for synthesis"
+                },
+                "files": {
+                    "speaker_wav": "Speaker audio file for cloning"
+                }
+            },
+            "/process": {
+                "method": "GET/POST",
+                "description": "MaryTTS-compatible synthesis endpoint",
+                "parameters": {
+                    "INPUT_TEXT": "Text to synthesize"
+                }
+            },
+            "/voices": {
+                "method": "GET",
+                "description": "MaryTTS-compatible voices endpoint"
+            },
+            "/locales": {
+                "method": "GET",
+                "description": "MaryTTS-compatible locales endpoint"
+            }
+        }
+    }
+    return jsonify(docs)
 
 
 def main():

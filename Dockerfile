@@ -15,5 +15,6 @@ COPY . /root
 
 RUN make install
 
-ENTRYPOINT ["tts"]
-CMD ["--help"]
+# Set up for running the server
+EXPOSE 5002
+CMD ["python3", "TTS/server/server.py", "--port", "5002"]
